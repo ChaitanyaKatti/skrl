@@ -125,6 +125,10 @@ class Runner:
             from skrl.agents.torch.sac import SAC, SAC_DEFAULT_CONFIG
 
             component = SAC_DEFAULT_CONFIG if "default_config" in name else SAC
+        elif name in ["sitt", "sitt_default_config"]:
+            from skrl.agents.torch.sitt import SITT, SITT_DEFAULT_CONFIG
+
+            component = SITT_DEFAULT_CONFIG if "default_config" in name else SITT
         elif name in ["td3", "td3_default_config"]:
             from skrl.agents.torch.td3 import TD3, TD3_DEFAULT_CONFIG
 
@@ -407,7 +411,7 @@ class Runner:
                 "reply_buffer": reply_buffer,
                 "collect_reference_motions": lambda num_samples: env.collect_reference_motions(num_samples),
             }
-        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "td3", "trpo"]:
+        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "sitt", "td3", "trpo"]:
             agent_id = possible_agents[0]
             agent_cfg = self._component(f"{agent_class}_DEFAULT_CONFIG").copy()
             agent_cfg.update(self._process_cfg(cfg["agent"]))
