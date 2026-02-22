@@ -229,6 +229,50 @@ def _generate_modules(layers: list[str], activations: list[str] | str) -> list[s
                     pass
                 else:
                     raise ValueError(f"Invalid or unsupported 'flatten' layer definition: {kwargs}")
+            # max pooling 2D
+            elif layer_type == "maxpool2d":
+                cls = "nn.MaxPool2d"
+                kwargs = layer[layer_type]
+                if type(kwargs) is list:
+                    kwargs = {k: v for k, v in zip(["kernel_size", "stride", "padding"][: len(kwargs)], kwargs)}
+                elif type(kwargs) is dict:
+                    mapping = {
+                        "strides": "stride",
+                    }
+                    kwargs = {mapping.get(k, k): f'"{v.lower()}"' if type(v) is str else v for k, v in kwargs.items()}
+                else:
+                    raise ValueError(f"Invalid or unsupported 'maxpool2d' layer definition: {kwargs}")
+            # avg pooling 2D
+            elif layer_type == "avgpool2d":
+                cls = "nn.AvgPool2d"
+                kwargs = layer[layer_type]
+                if type(kwargs) is list:
+                    kwargs = {k: v for k, v in zip(["kernel_size", "stride", "padding", "ceil_mode", "count_include_pad"][: len(kwargs)], kwargs)}
+                elif type(kwargs) is dict:
+                    mapping = {
+                        "strides": "stride",
+                        "include_pad": "count_include_pad",
+                    }
+                    kwargs = {mapping.get(k, k): f'"{v.lower()}"' if type(v) is str else v for k, v in kwargs.items()}
+                else:
+                    raise ValueError(f"Invalid or unsupported 'avgpool2d' layer definition: {kwargs}")
+            # batch normalization 2D
+            elif layer_type == "batchnorm2d":
+                cls = "nn.BatchNorm2d"
+                kwargs = layer[layer_type]
+                if type(kwargs) in [int, float]:
+                    kwargs = {"num_features": int(kwargs)}
+                elif type(kwargs) is list:
+                    kwargs = {k: v for k, v in zip(["num_features", "eps", "momentum", "affine", "track_running_stats"][: len(kwargs)], kwargs)}
+                elif type(kwargs) is dict:
+                    mapping = {
+                        "features": "num_features",
+                        "use_affine": "affine",
+                        "track_stats": "track_running_stats",
+                    }
+                    kwargs = {mapping.get(k, k): v for k, v in kwargs.items()}
+                else:
+                    raise ValueError(f"Invalid or unsupported 'batchnorm2d' layer definition: {kwargs}")
             else:
                 raise ValueError(f"Invalid or unsupported layer: {layer_type}")
         else:

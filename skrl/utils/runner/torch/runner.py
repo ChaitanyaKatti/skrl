@@ -129,6 +129,7 @@ class Runner:
         from skrl.agents.torch.ddqn import DDQN, DDQN_CFG
         from skrl.agents.torch.dqn import DQN, DQN_CFG
         from skrl.agents.torch.ppo import PPO, PPO_CFG
+        from skrl.agents.torch.sitt import SITT, SITT_CFG
         from skrl.agents.torch.rpo import RPO, RPO_CFG
         from skrl.agents.torch.sac import SAC, SAC_CFG
         from skrl.agents.torch.td3 import TD3, TD3_CFG
@@ -171,6 +172,8 @@ class Runner:
             "dqn_cfg": DQN_CFG,
             "ppo": PPO,
             "ppo_cfg": PPO_CFG,
+            "sitt": SITT,
+            "sitt_cfg": SITT_CFG,
             "rpo": RPO,
             "rpo_cfg": RPO_CFG,
             "sac": SAC,
@@ -463,7 +466,7 @@ class Runner:
                 "reply_buffer": reply_buffer,
                 "collect_reference_motions": lambda num_samples: env.collect_reference_motions(num_samples),
             }
-        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "td3", "trpo"]:
+        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "sitt", "td3", "trpo"]:
             agent_id = possible_agents[0]
             agent_cfg = dataclasses.asdict(self._component(f"{agent_class}_CFG")(**self._process_cfg(cfg["agent"])))
             agent_cfg.get("observation_preprocessor_kwargs", {}).update(
