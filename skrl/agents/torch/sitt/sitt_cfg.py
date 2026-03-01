@@ -134,6 +134,9 @@ class SITT_CFG(AgentCfg):
     mixed_precision: bool = False
     """Whether to enable automatic mixed precision for higher performance."""
 
+    kl_penalty_scale: float = 0.0
+    """KL-divergence penalty between teacher and student for reward shaping."""
+
     def expand(self) -> None:
         """Expand the configuration."""
         super().expand()
