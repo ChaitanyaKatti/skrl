@@ -161,6 +161,8 @@ class SITT(Agent):
         self._learning_rate = self.cfg["learning_rate"]
         self._learning_rate_scheduler = self.cfg["learning_rate_scheduler"]
 
+        self._student_learning_rate = self.cfg["student_learning_rate"]
+
         self._state_preprocessor = self.cfg["state_preprocessor"]
         self._value_preprocessor = self.cfg["value_preprocessor"]
 
