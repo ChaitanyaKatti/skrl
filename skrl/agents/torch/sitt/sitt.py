@@ -112,12 +112,12 @@ class SITT(Agent):
         # broadcast models' parameters in distributed runs
         if config.torch.is_distributed:
             logger.info(f"Broadcasting models' parameters")
-            if self.student is not None:
-                self.student.broadcast_parameters()
             if self.teacher is not None:
                 self.teacher.broadcast_parameters()
-            if self.value is not None and self.value is not self.teacher:
-                self.value.broadcast_parameters()
+                if self.value is not None and self.value is not self.teacher:
+                    self.value.broadcast_parameters()
+            if self.student is not None:
+                self.student.broadcast_parameters() 
 
         # set up automatic mixed precision
         self._device_type = torch.device(self.device).type
@@ -127,7 +127,7 @@ class SITT(Agent):
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.cfg.mixed_precision)
 
         # set up optimizer and learning rate scheduler
-        if self.student is not None and self.teacher is not None and self.value is not None:
+        if self.teacher is not None and self.value is not None:
             # - optimizers
             if self.teacher is self.value:
                 self.optimizer = torch.optim.Adam(self.teacher.parameters(), lr=self.cfg.learning_rate)
@@ -141,6 +141,16 @@ class SITT(Agent):
             if self.scheduler is not None:
                 self.scheduler = self.cfg.learning_rate_scheduler[0](
                     self.optimizer, **self.cfg.learning_rate_scheduler_kwargs[0]
+                )
+        if self.student is not None:
+            # - optimizers
+            self.student_optimizer = torch.optim.Adam(self.student.parameters(), lr=self.cfg.student_learning_rate)
+            self.checkpoint_modules["student_optimizer"] = self.student_optimizer
+            # - learning rate schedulers
+            self.student_scheduler = self.cfg.learning_rate_scheduler[1]
+            if self.student_scheduler is not None:
+                self.student_scheduler = self.cfg.learning_rate_scheduler[1](
+                    self.student_optimizer, **self.cfg.learning_rate_scheduler_kwargs[1]
                 )
 
         # set up preprocessors
@@ -219,16 +229,18 @@ class SITT(Agent):
 
         # sample stochastic actions
         with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
-            teacher_actions, teacher_outputs = self.teacher.act(inputs, role="policy")
-            student_actions, student_outputs = self.student.act(inputs, role="policy")
-            self._current_log_prob = student_outputs["log_prob"]
+            student_actions, student_outputs = self.student.act(inputs, role="student")
+            teacher_actions, teacher_outputs = self.teacher.act({**inputs, "taken_actions": student_actions}, role="teacher")
+            self._current_log_prob = teacher_outputs["log_prob"]
 
             # compute values
             if self.training:
                 values, _ = self.value.act(inputs, role="value")
                 self._current_values = self._value_preprocessor(values, inverse=True)
-
-        return student_actions, teacher_outputs
+            self._current_kl_div = torch.distributions.kl_divergence(
+                self.teacher.distribution(), self.student.distribution()
+            ).sum(dim=-1)
+        return student_actions, student_outputs
 
     def record_transition(
         self,
@@ -385,7 +397,7 @@ class SITT(Agent):
                         "states": self._state_preprocessor(sampled_states, train=not epoch),
                     }
 
-                    _, outputs = self.teacher.act({**inputs, "taken_actions": sampled_actions}, role="policy")
+                    _, outputs = self.teacher.act({**inputs, "taken_actions": sampled_actions}, role="teacher")
                     next_log_prob = outputs["log_prob"]
 
                     # compute approximate KL divergence
@@ -400,7 +412,7 @@ class SITT(Agent):
 
                     # compute entropy loss
                     if self.cfg.entropy_loss_scale:
-                        entropy_loss = -self.cfg.entropy_loss_scale * self.teacher.get_entropy(role="policy").mean()
+                        entropy_loss = -self.cfg.entropy_loss_scale * self.teacher.get_entropy(role="teacher").mean()
                     else:
                         entropy_loss = 0
 
@@ -463,67 +475,73 @@ class SITT(Agent):
 
         cumulative_student_loss = 0
 
+        sampled_batches = self.memory.sample_all(names=self._tensors_names, mini_batches=self.cfg.student_mini_batches)
+
         # Student learning epochs: Supervised learning
-        for epoch in range(self.cfg.learning_epochs):
-            # mini-batches loop
-            for (
-                sampled_observations,
-                sampled_states,
-                sampled_actions,
-                _,
-                _,
-                _,
-                _,
-            ) in sampled_batches:
+        if timestep >= 12128: # debug
+            for epoch in range(self.cfg.learning_epochs):
+                # mini-batches loop
+                for (
+                    sampled_observations,
+                    sampled_states,
+                    sampled_actions,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) in sampled_batches:
 
-                with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-                    inputs = {
-                        "observations": self._observation_preprocessor(sampled_observations, train=not epoch),
-                        "states": self._state_preprocessor(sampled_states, train=not epoch),
-                    }
+                    with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                        inputs = {
+                            "observations": self._observation_preprocessor(sampled_observations, train=not epoch),
+                            "states": self._state_preprocessor(sampled_states, train=not epoch),
+                        }
 
-                    # generate teacher's actions
-                    with torch.no_grad():
-                        _, _ = self.teacher.act({**inputs}, role="policy")
+                        # generate teacher's actions
+                        with torch.no_grad():
+                            _, _ = self.teacher.act({**inputs}, role="policy")
 
-                    # generate student's actions
-                    _, _ = self.student.act({**inputs}, role="policy")
+                        # generate student's actions
+                        _, _ = self.student.act({**inputs}, role="policy")
 
-                    # compute KL divergence between teacher and student
-                    kl_div = torch.distributions.kl_divergence(self.teacher.distribution(), self.student.distribution()).mean()
+                        # compute KL divergence between teacher and student
+                        kl_div = torch.distributions.kl_divergence(self.teacher.distribution(), self.student.distribution()).mean()
 
-                # optimization step
-                self.optimizer.zero_grad()
-                self.scaler.scale(kl_div).backward()
+                    # optimization step
+                    self.optimizer.zero_grad()
+                    self.scaler.scale(kl_div).backward()
 
-                if config.torch.is_distributed:
-                    self.student.reduce_parameters()
+                    if config.torch.is_distributed:
+                        self.student.reduce_parameters()
 
-                if self.cfg.grad_norm_clip > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    nn.utils.clip_grad_norm_(self.student.parameters(), self.cfg.grad_norm_clip)
+                    if self.cfg.grad_norm_clip > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        nn.utils.clip_grad_norm_(self.student.parameters(), self.cfg.grad_norm_clip)
 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
 
-                # update cumulative losses
-                cumulative_student_loss += kl_div.item()
+                    # update cumulative losses
+                    cumulative_student_loss += kl_div.item()
+
+            self.track_data(
+                "Loss / Student Policy loss", cumulative_student_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
+            )
+            self.track_data("Policy / Student Standard deviation", self.student.distribution().stddev.mean().item())
 
         # record data
         self.track_data(
             "Loss / Teacher Policy loss", cumulative_teacher_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
         )
         self.track_data(
-            "Loss / Student Policy loss", cumulative_student_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
+            "Loss / Value loss", cumulative_value_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
         )
-        self.track_data("Loss / Value loss", cumulative_value_loss / (self.cfg.learning_epochs * self.cfg.mini_batches))
         if self.cfg.entropy_loss_scale:
             self.track_data(
                 "Loss / Entropy loss", cumulative_entropy_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
             )
 
-        self.track_data("Policy / Teacher Standard deviation", self.teacher.distribution(role="policy").stddev.mean().item())
-        self.track_data("Policy / Student Standard deviation", self.student.distribution(role="policy").stddev.mean().item())
+        self.track_data("Policy / Teacher Standard deviation", self.teacher.distribution().stddev.mean().item())
 
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])

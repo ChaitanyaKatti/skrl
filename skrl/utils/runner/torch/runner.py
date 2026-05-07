@@ -129,9 +129,9 @@ class Runner:
         from skrl.agents.torch.ddqn import DDQN, DDQN_CFG
         from skrl.agents.torch.dqn import DQN, DQN_CFG
         from skrl.agents.torch.ppo import PPO, PPO_CFG
-        from skrl.agents.torch.sitt import SITT, SITT_CFG
         from skrl.agents.torch.rpo import RPO, RPO_CFG
         from skrl.agents.torch.sac import SAC, SAC_CFG
+        from skrl.agents.torch.sitt import SITT, SITT_CFG
         from skrl.agents.torch.td3 import TD3, TD3_CFG
         from skrl.agents.torch.trpo import TRPO, TRPO_CFG
         from skrl.memories.torch import RandomMemory
@@ -172,12 +172,12 @@ class Runner:
             "dqn_cfg": DQN_CFG,
             "ppo": PPO,
             "ppo_cfg": PPO_CFG,
-            "sitt": SITT,
-            "sitt_cfg": SITT_CFG,
             "rpo": RPO,
             "rpo_cfg": RPO_CFG,
             "sac": SAC,
             "sac_cfg": SAC_CFG,
+            "sitt": SITT,
+            "sitt_cfg": SITT_CFG,
             "td3": TD3,
             "td3_cfg": TD3_CFG,
             "trpo": TRPO,
@@ -374,7 +374,7 @@ class Runner:
                 )
                 models[agent_id][roles[1]] = models[agent_id][roles[0]]
 
-                # Create sperate student role also models[aget_id]['student']
+                # Create seperate student role, models[aget_id]['student']
                 if agent_class == 'sitt':
                     role = 'student'
                     model_class = models_cfg[role].get("class")
@@ -383,20 +383,24 @@ class Runner:
                     del models_cfg[role]["class"]
                     model_class = self._component(model_class)
                     observation_space = observation_spaces[agent_id]
-                    source = model_class(
-                        observation_space=observation_space,
-                        action_space=action_spaces[agent_id],
-                        device=device,
-                        **self._process_cfg(models_cfg[role]),
-                        return_source=True,
-                    )
-                    print("==================================================")
-                    print(f"Model (role): student")
-                    print("==================================================\n")
-                    print(source)
-                    print("--------------------------------------------------")
+                    if self._verbose:
+                        source = model_class(
+                            observation_space=observation_space,
+                            state_space=state_spaces[agent_id],
+                            action_space=action_spaces[agent_id],
+                            device=device,
+                            **self._process_cfg(models_cfg[role]),
+                            return_source=True,
+                        )
+                        print("==================================================")
+                        print(f"Model (role): student")
+                        print("==================================================\n")
+                        print(source)
+                        print("--------------------------------------------------")
+                    # instantiate model
                     models[agent_id]['student'] = model_class(
                         observation_space=observation_space,
+                        state_space=state_spaces[agent_id],
                         action_space=action_spaces[agent_id],
                         device=device,
                         **self._process_cfg(models_cfg[role]),

@@ -20,6 +20,12 @@ class SITT_CFG(AgentCfg):
     mini_batches: int = 2
     """Number of mini batches to sample when updating."""
 
+    student_learning_epochs: int = 8
+    """Number of learning epochs to perform during student updates."""
+
+    student_mini_batches: int = 2
+    """Number of mini batches to sample when updating the student."""
+
     discount_factor: float = 0.99
     """Parameter that balances the importance of future rewards (close to 1.0) versus immediate rewards (close to 0.0).
 
@@ -30,14 +36,21 @@ class SITT_CFG(AgentCfg):
     """TD(lambda) coefficient for computing Generalized Advantage Estimation (GAE)."""
 
     learning_rate: float | tuple[float, float] = 1e-3
-    """Learning rate for the policy and value networks.
+    """Learning rate for the teacher and value networks.
+
+    * If a float is provided, the same learning rate will be used for the networks.
+    * If a tuple is provided, its elements will be used for each network in order.
+    """
+ 
+    student_learning_rate: float = 1e-3
+    """Learning rate for the student network.
 
     * If a float is provided, the same learning rate will be used for the networks.
     * If a tuple is provided, its elements will be used for each network in order.
     """
 
-    learning_rate_scheduler: type | tuple[type | None, type | None] | None = None
-    """Learning rate scheduler class for the policy and value networks.
+    learning_rate_scheduler: type | tuple[type | None, type | None, type | None] | None = None
+    """Learning rate scheduler class for the teacher, student and value networks.
 
     See :ref:`learning_rate_schedulers` for more details.
 
@@ -45,7 +58,7 @@ class SITT_CFG(AgentCfg):
     * If a tuple is provided, its elements will be used for each network in order.
     """
 
-    learning_rate_scheduler_kwargs: dict | tuple[dict, dict] = dataclasses.field(default_factory=dict)
+    learning_rate_scheduler_kwargs: dict | tuple[dict, dict, dict] = dataclasses.field(default_factory=dict)
     """Keyword arguments for the learning rate scheduler's constructor.
 
     See :ref:`learning_rate_schedulers` for more details.
