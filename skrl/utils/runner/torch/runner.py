@@ -324,6 +324,8 @@ class Runner:
             # shared models
             else:
                 roles = list(models_cfg.keys())
+                if agent_class == 'sitt':
+                    roles = ["teacher", "value"]
                 if len(roles) != 2:
                     raise ValueError(
                         "Runner currently only supports shared models, made up of exactly two models. "
@@ -371,6 +373,34 @@ class Runner:
                     parameters=parameters,
                 )
                 models[agent_id][roles[1]] = models[agent_id][roles[0]]
+
+                # Create sperate student role also models[aget_id]['student']
+                if agent_class == 'sitt':
+                    role = 'student'
+                    model_class = models_cfg[role].get("class")
+                    if not model_class:
+                        raise ValueError(f"No 'class' field defined in 'models:{role}' cfg")
+                    del models_cfg[role]["class"]
+                    model_class = self._component(model_class)
+                    observation_space = observation_spaces[agent_id]
+                    source = model_class(
+                        observation_space=observation_space,
+                        action_space=action_spaces[agent_id],
+                        device=device,
+                        **self._process_cfg(models_cfg[role]),
+                        return_source=True,
+                    )
+                    print("==================================================")
+                    print(f"Model (role): student")
+                    print("==================================================\n")
+                    print(source)
+                    print("--------------------------------------------------")
+                    models[agent_id]['student'] = model_class(
+                        observation_space=observation_space,
+                        action_space=action_spaces[agent_id],
+                        device=device,
+                        **self._process_cfg(models_cfg[role]),
+                    )
 
         # initialize lazy modules' parameters
         for agent_id in possible_agents:
