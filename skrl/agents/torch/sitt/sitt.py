@@ -257,18 +257,27 @@ class SITT(Agent):
         :rtype: torch.Tensor
         """
         # sample random actions
-        # TODO, check for stochasticity
-        if timestep < self._random_timesteps:
-            return self.teacher.random_act({"states": self._state_preprocessor(states)}, role="policy")
+        # if timestep < self._random_timesteps:
+        #     student_actions, student_log_prob, student_outputs = self.student.act({"states": states}, role="")
+        #     teacher_actions, teacher_log_prob, teacher_outputs = self.teacher.act({"states": states, "taken_actions": student_actions}, role="teacher")
+        #     return student_actions, teacher_log_prob, student_outputs
 
-        # sample stochastic actions
+        # Teacher training only
+        # if timestep == 0 and timesteps == 0: # Testing mode
         with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
-            student_actions, student_log_prob, student_outputs = self.student.act({"states": self._state_preprocessor(states)}, role="policy")
-            teacher_actions, teacher_log_prob, teacher_outputs = self.teacher.act({"states": self._state_preprocessor(states), "taken_actions": student_actions}, role="policy")
+            states = self._state_preprocessor(states)
+            student_actions, student_log_prob, student_outputs = self.student.act({"states": states}, role="")
+            teacher_actions, teacher_log_prob, teacher_outputs = self.teacher.act({"states": states, "taken_actions": student_actions}, role="teacher")
             self._current_log_prob = teacher_log_prob
-            self._current_kl_div = torch.distributions.kl_divergence(self.teacher.distribution(role="policy"), self.student.distribution(role="policy"))
-
-        return student_actions, teacher_log_prob, student_outputs
+            self._current_kl_div = torch.distributions.kl_divergence(self.teacher.distribution(), self.student.distribution()).sum(dim=-1)
+            return student_actions, teacher_log_prob, student_outputs
+        # else: # Training mode
+        # with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
+        #     states = self._state_preprocessor(states)
+        #     teacher_actions, teacher_log_prob, teacher_outputs = self.teacher.act({"states": states}, role="teacher")
+        #     self._current_log_prob = teacher_log_prob
+        #     return teacher_actions, teacher_log_prob, teacher_outputs
+        # return (teacher_actions+9*student_actions)/10.0, teacher_log_prob, teacher_outputs
 
     def record_transition(
         self,
@@ -559,53 +568,50 @@ class SITT(Agent):
         sampled_batches = self.memory.sample_all(names=self._tensors_names, mini_batches=self._student_mini_batches)
 
         cumulative_student_loss = 0
-
+    
         # Student learning epochs: Supervised learning
-        for epoch in range(self._learning_epochs):
-            # mini-batches loop
-            for (
-                sampled_states,
-                sampled_actions,
-                _,
-                _,
-                _,
-                _,
-            ) in sampled_batches:
+        if timestep >= 12128: # debug
+            for epoch in range(self._student_learning_epochs):
+                # mini-batches loop
+                for (
+                    sampled_states,
+                    sampled_actions,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) in sampled_batches:
+                    with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
 
-                with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
+                        sampled_states = self._state_preprocessor(sampled_states, train=not epoch)
 
-                    sampled_states = self._state_preprocessor(sampled_states, train=not epoch)
+                        # generate teacher's actions
+                        with torch.no_grad():
+                            _, _, _ = self.teacher.act({"states": sampled_states}, role="teacher")
 
-                    # generate teacher's actions
-                    with torch.no_grad():
-                        _, _, _ = self.teacher.act(
-                            {"states": sampled_states}, role="policy"
-                        )
+                        # generate student's actions
+                        _, _, _ = self.student.act({"states": sampled_states}, role="")
 
-                    # generate student's actions
-                    _, _, _ = self.student.act(
-                        {"states": sampled_states}, role="policy"
-                    )
+                        # compute KL divergence between teacher and student
+                        loss = torch.distributions.kl_divergence(self.teacher.distribution(), self.student.distribution()).mean()
 
-                    # compute KL divergence between teacher and student
-                    kl_div = torch.distributions.kl_divergence(self.teacher.distribution(), self.student.distribution()).mean()
+                    # optimization step
+                    self.student_optimizer.zero_grad()
+                    loss.backward()
 
-                # optimization step
-                self.optimizer.zero_grad()
-                self.scaler.scale(kl_div).backward()
+                    if config.torch.is_distributed:
+                        self.student.reduce_parameters()
 
-                if config.torch.is_distributed:
-                    self.student.reduce_parameters()
+                    if self._grad_norm_clip > 0:
+                        nn.utils.clip_grad_norm_(self.student.parameters(), self._grad_norm_clip)
 
-                if self._grad_norm_clip > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    nn.utils.clip_grad_norm_(self.student.parameters(), self._grad_norm_clip)
+                    self.student_optimizer.step()
 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                    # update cumulative losses
+                    cumulative_student_loss += loss.item()
 
-                # update cumulative losses
-                cumulative_student_loss += kl_div.item()
+            self.track_data("Loss / Student Policy loss", cumulative_student_loss / (self._student_learning_epochs * self._student_mini_batches))
+            self.track_data("Policy / Student Standard deviation", self.student.distribution().stddev.mean().item())
 
         # record data
         self.track_data("Loss / Teacher Policy loss", cumulative_teacher_loss / (self._learning_epochs * self._mini_batches))
