@@ -18,7 +18,7 @@ from skrl.resources.schedulers.torch import KLAdaptiveLR
 from skrl.utils import ScopedTimer
 
 from .sitt_cfg import SITT_CFG
-
+from tqdm import tqdm
 
 def compute_gae(
     *,
@@ -114,10 +114,10 @@ class SITT(Agent):
             logger.info(f"Broadcasting models' parameters")
             if self.teacher is not None:
                 self.teacher.broadcast_parameters()
-                if self.value is not None and self.value is not self.teacher:
+                if self.value is not None and self.teacher is not self.value:
                     self.value.broadcast_parameters()
             if self.student is not None:
-                self.student.broadcast_parameters() 
+                self.student.broadcast_parameters()
 
         # set up automatic mixed precision
         self._device_type = torch.device(self.device).type
@@ -130,10 +130,10 @@ class SITT(Agent):
         if self.teacher is not None and self.value is not None:
             # - optimizers
             if self.teacher is self.value:
-                self.optimizer = torch.optim.Adam(self.teacher.parameters(), lr=self.cfg.learning_rate)
+                self.optimizer = torch.optim.Adam(self.teacher.parameters(), lr=self.cfg.learning_rate[0])
             else:
                 self.optimizer = torch.optim.Adam(
-                    itertools.chain(self.student.parameters(), self.teacher.parameters(), self.value.parameters()), lr=self.cfg.learning_rate
+                    itertools.chain(self.teacher.parameters(), self.value.parameters()), lr=self.cfg.learning_rate[0]
                 )
             self.checkpoint_modules["optimizer"] = self.optimizer
             # - learning rate schedulers
@@ -202,7 +202,7 @@ class SITT(Agent):
         self._current_next_states = None
         self._current_log_prob = None
         self._current_values = None
-        self._current_kl_div = None
+        self._current_kl_div = 0
         self._rollout = 0
 
     def act(
@@ -228,19 +228,23 @@ class SITT(Agent):
             return self.teacher.random_act(inputs, role="policy")
 
         # sample stochastic actions
-        with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
-            student_actions, student_outputs = self.student.act(inputs, role="student")
-            teacher_actions, teacher_outputs = self.teacher.act({**inputs, "taken_actions": student_actions}, role="teacher")
-            self._current_log_prob = teacher_outputs["log_prob"]
-
-            # compute values
+        with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
             if self.training:
+                # student_actions, student_outputs = self.student.act(inputs, role="student")
+                # teacher_actions, teacher_outputs = self.teacher.act({**inputs, "taken_actions": student_actions}, role="teacher")
+                teacher_actions, teacher_outputs = self.teacher.act(inputs, role="teacher")
+                self._current_log_prob = teacher_outputs["log_prob"]
+                # compute values
                 values, _ = self.value.act(inputs, role="value")
                 self._current_values = self._value_preprocessor(values, inverse=True)
-            self._current_kl_div = torch.distributions.kl_divergence(
-                self.teacher.distribution(), self.student.distribution()
-            ).sum(dim=-1)
-        return student_actions, student_outputs
+                # self._current_kl_div = torch.distributions.kl_divergence(
+                #     self.teacher.distribution(), self.student.distribution()
+                # ).sum(dim=-1)
+                return teacher_actions, teacher_outputs
+            else:
+                print("Inference mode: using student for action selection. Time: {}".format(timestep)) # debug
+                student_actions, student_outputs = self.student.act(inputs, role="student")
+                return student_actions, student_outputs
 
     def record_transition(
         self,
@@ -334,7 +338,8 @@ class SITT(Agent):
                     self.update(timestep=timestep, timesteps=timesteps)
                     self.enable_models_training_mode(False)
                     self.track_data("Stats / Algorithm update time (ms)", timer.elapsed_time_ms)
-
+            if timestep > 512+62-1 and timestep % 128 == 0:
+                self.write_checkpoint(timestep=timestep, timesteps=timesteps)
         # write tracking data and checkpoints
         super().post_interaction(timestep=timestep, timesteps=timesteps)
 
@@ -473,13 +478,11 @@ class SITT(Agent):
                 else:
                     self.scheduler.step()
 
-        cumulative_student_loss = 0
-
-        sampled_batches = self.memory.sample_all(names=self._tensors_names, mini_batches=self.cfg.student_mini_batches)
-
         # Student learning epochs: Supervised learning
-        if timestep >= 12128: # debug
-            for epoch in range(self.cfg.learning_epochs):
+        if timestep >= 512+64-1: # debug
+            cumulative_student_loss = 0
+            sampled_batches = self.memory.sample_all(names=self._tensors_names, mini_batches=self.cfg.student_mini_batches)
+            for epoch in tqdm(range(self.cfg.student_learning_epochs)):
                 # mini-batches loop
                 for (
                     sampled_observations,
@@ -499,33 +502,32 @@ class SITT(Agent):
 
                         # generate teacher's actions
                         with torch.no_grad():
-                            _, _ = self.teacher.act({**inputs}, role="policy")
+                            _, _ = self.teacher.act(inputs, role="teacher")
 
                         # generate student's actions
-                        _, _ = self.student.act({**inputs}, role="policy")
+                        _, _ = self.student.act(inputs, role="student")
 
                         # compute KL divergence between teacher and student
-                        kl_div = torch.distributions.kl_divergence(self.teacher.distribution(), self.student.distribution()).mean()
+                        loss = torch.distributions.kl_divergence(self.teacher.distribution(), self.student.distribution()).mean()
 
                     # optimization step
-                    self.optimizer.zero_grad()
-                    self.scaler.scale(kl_div).backward()
+                    self.student_optimizer.zero_grad()
+                    self.scaler.scale(loss).backward()
 
                     if config.torch.is_distributed:
                         self.student.reduce_parameters()
 
                     if self.cfg.grad_norm_clip > 0:
-                        self.scaler.unscale_(self.optimizer)
+                        self.scaler.unscale_(self.student_optimizer)
                         nn.utils.clip_grad_norm_(self.student.parameters(), self.cfg.grad_norm_clip)
 
-                    self.scaler.step(self.optimizer)
+                    self.scaler.step(self.student_optimizer)
                     self.scaler.update()
 
                     # update cumulative losses
-                    cumulative_student_loss += kl_div.item()
-
+                    cumulative_student_loss += loss.item()
             self.track_data(
-                "Loss / Student Policy loss", cumulative_student_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
+                "Loss / Student Policy loss", cumulative_student_loss / (self.cfg.student_learning_epochs * self.cfg.student_mini_batches)
             )
             self.track_data("Policy / Student Standard deviation", self.student.distribution().stddev.mean().item())
 
