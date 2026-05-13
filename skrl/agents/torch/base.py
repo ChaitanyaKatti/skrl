@@ -364,12 +364,12 @@ class Agent(ABC):
             self._cumulative_timesteps.add_(1)
 
             # check ended episodes
-            finished_episodes = (terminated + truncated).nonzero(as_tuple=False)
-            if finished_episodes.numel():
+            finished_episodes = (terminated + truncated).nonzero(as_tuple=True) # Use as_tuple=True
+            if finished_episodes[0].numel():                                    # Pick the first axis to check if there are finished episodes
 
                 # storage cumulative rewards and timesteps
-                self._track_rewards.extend(self._cumulative_rewards[finished_episodes][:, 0].reshape(-1).tolist())
-                self._track_timesteps.extend(self._cumulative_timesteps[finished_episodes][:, 0].reshape(-1).tolist())
+                self._track_rewards.extend(self._cumulative_rewards[finished_episodes].reshape(-1).tolist())    # No need to reduce dimensions with [:,0]
+                self._track_timesteps.extend(self._cumulative_timesteps[finished_episodes].reshape(-1).tolist())# No need to reduce dimensions with [:,0]
 
                 # reset the cumulative rewards and timesteps
                 self._cumulative_rewards[finished_episodes] = 0
@@ -384,12 +384,12 @@ class Agent(ABC):
                 track_rewards = np.array(self._track_rewards)
                 track_timesteps = np.array(self._track_timesteps)
 
-                self.tracking_data["Reward / Total reward (max)"].append(np.max(track_rewards))
-                self.tracking_data["Reward / Total reward (min)"].append(np.min(track_rewards))
+                self.tracking_data["Reward / Total reward (90 %)"].append(np.percentile(track_rewards, 90))
+                self.tracking_data["Reward / Total reward (10 %)"].append(np.percentile(track_rewards, 10))
                 self.tracking_data["Reward / Total reward (mean)"].append(np.mean(track_rewards))
-
-                self.tracking_data["Episode / Total timesteps (max)"].append(np.max(track_timesteps))
-                self.tracking_data["Episode / Total timesteps (min)"].append(np.min(track_timesteps))
+    
+                self.tracking_data["Episode / Total timesteps (90 %)"].append(np.percentile(track_timesteps, 90))
+                self.tracking_data["Episode / Total timesteps (10 %)"].append(np.percentile(track_timesteps, 10))
                 self.tracking_data["Episode / Total timesteps (mean)"].append(np.mean(track_timesteps))
 
     def enable_training_mode(self, enabled: bool = True, *, apply_to_models: bool = False) -> None:
