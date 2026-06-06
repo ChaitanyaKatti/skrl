@@ -242,7 +242,6 @@ class SITT(Agent):
                 # ).sum(dim=-1)
                 return teacher_actions, teacher_outputs
             else:
-                print("Inference mode: using student for action selection. Time: {}".format(timestep)) # debug
                 student_actions, student_outputs = self.student.act(inputs, role="student")
                 return student_actions, student_outputs
 
@@ -338,7 +337,7 @@ class SITT(Agent):
                     self.update(timestep=timestep, timesteps=timesteps)
                     self.enable_models_training_mode(False)
                     self.track_data("Stats / Algorithm update time (ms)", timer.elapsed_time_ms)
-            if timestep > 512+62-1 and timestep % 128 == 0:
+            if timestep > self.cfg.start_student_training_timestep+self.cfg.rollouts-1 and timestep % 64 == 0: # debug
                 self.write_checkpoint(timestep=timestep, timesteps=timesteps)
         # write tracking data and checkpoints
         super().post_interaction(timestep=timestep, timesteps=timesteps)
@@ -349,137 +348,152 @@ class SITT(Agent):
         :param timestep: Current timestep.
         :param timesteps: Number of timesteps.
         """
-        # compute returns and advantages
-        with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-            inputs = {
-                "observations": self._observation_preprocessor(self._current_next_observations),
-                "states": self._state_preprocessor(self._current_next_states),
-            }
-            self.value.enable_training_mode(False)
-            last_values, _ = self.value.act(inputs, role="value")
-            self.value.enable_training_mode(True)
-            last_values = self._value_preprocessor(last_values, inverse=True)
+        # Teacher Value learning epochs: Proximal Policy Optimization (PPO)
+        if timestep < self.cfg.start_student_training_timestep+self.cfg.rollouts:
+            # compute returns and advantages
+            with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                inputs = {
+                    "observations": self._observation_preprocessor(self._current_next_observations),
+                    "states": self._state_preprocessor(self._current_next_states),
+                }
+                self.value.enable_training_mode(False)
+                last_values, _ = self.value.act(inputs, role="value")
+                self.value.enable_training_mode(True)
+                last_values = self._value_preprocessor(last_values, inverse=True)
 
-        values = self.memory.get_tensor_by_name("values")
-        returns, advantages = compute_gae(
-            rewards=self.memory.get_tensor_by_name("rewards"),
-            terminated=self.memory.get_tensor_by_name("terminated"),
-            values=values,
-            next_values=last_values,
-            discount_factor=self.cfg.discount_factor,
-            lambda_coefficient=self.cfg.gae_lambda,
-        )
+            values = self.memory.get_tensor_by_name("values")
+            returns, advantages = compute_gae(
+                rewards=self.memory.get_tensor_by_name("rewards"),
+                terminated=self.memory.get_tensor_by_name("terminated"),
+                values=values,
+                next_values=last_values,
+                discount_factor=self.cfg.discount_factor,
+                lambda_coefficient=self.cfg.gae_lambda,
+            )
 
-        self.memory.set_tensor_by_name("values", self._value_preprocessor(values, train=True))
-        self.memory.set_tensor_by_name("returns", self._value_preprocessor(returns, train=True))
-        self.memory.set_tensor_by_name("advantages", advantages)
+            self.memory.set_tensor_by_name("values", self._value_preprocessor(values, train=True))
+            self.memory.set_tensor_by_name("returns", self._value_preprocessor(returns, train=True))
+            self.memory.set_tensor_by_name("advantages", advantages)
+            
+            # sample mini-batches from memory
+            sampled_batches = self.memory.sample_all(names=self._tensors_names, mini_batches=self.cfg.mini_batches)
 
-        # sample mini-batches from memory
-        sampled_batches = self.memory.sample_all(names=self._tensors_names, mini_batches=self.cfg.mini_batches)
+            cumulative_teacher_loss = 0
+            cumulative_entropy_loss = 0
+            cumulative_value_loss = 0
+            
+            # teacher learning epochs
+            for epoch in range(self.cfg.learning_epochs):
+                kl_divergences = []
 
-        cumulative_teacher_loss = 0
-        cumulative_entropy_loss = 0
-        cumulative_value_loss = 0
+                # mini-batches loop
+                for (
+                    sampled_observations,
+                    sampled_states,
+                    sampled_actions,
+                    sampled_log_prob,
+                    sampled_values,
+                    sampled_returns,
+                    sampled_advantages,
+                ) in sampled_batches:
 
-        # teacher learning epochs
-        for epoch in range(self.cfg.learning_epochs):
-            kl_divergences = []
+                    with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                        inputs = {
+                            "observations": self._observation_preprocessor(sampled_observations),
+                            "states": self._state_preprocessor(sampled_states),
+                        }
 
-            # mini-batches loop
-            for (
-                sampled_observations,
-                sampled_states,
-                sampled_actions,
-                sampled_log_prob,
-                sampled_values,
-                sampled_returns,
-                sampled_advantages,
-            ) in sampled_batches:
+                        _, outputs = self.teacher.act({**inputs, "taken_actions": sampled_actions}, role="teacher")
+                        next_log_prob = outputs["log_prob"]
 
-                with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-                    inputs = {
-                        "observations": self._observation_preprocessor(sampled_observations, train=not epoch),
-                        "states": self._state_preprocessor(sampled_states, train=not epoch),
-                    }
+                        # compute approximate KL divergence
+                        with torch.no_grad():
+                            ratio = next_log_prob - sampled_log_prob
+                            kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
+                            kl_divergences.append(kl_divergence)
 
-                    _, outputs = self.teacher.act({**inputs, "taken_actions": sampled_actions}, role="teacher")
-                    next_log_prob = outputs["log_prob"]
+                        # early stopping with KL divergence
+                        if self.cfg.kl_threshold and kl_divergence > self.cfg.kl_threshold:
+                            break
 
-                    # compute approximate KL divergence
-                    with torch.no_grad():
-                        ratio = next_log_prob - sampled_log_prob
-                        kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
-                        kl_divergences.append(kl_divergence)
+                        # compute entropy loss
+                        if self.cfg.entropy_loss_scale:
+                            entropy_loss = -self.cfg.entropy_loss_scale * self.teacher.get_entropy(role="teacher").mean()
+                        else:
+                            entropy_loss = 0
 
-                    # early stopping with KL divergence
-                    if self.cfg.kl_threshold and kl_divergence > self.cfg.kl_threshold:
-                        break
-
-                    # compute entropy loss
-                    if self.cfg.entropy_loss_scale:
-                        entropy_loss = -self.cfg.entropy_loss_scale * self.teacher.get_entropy(role="teacher").mean()
-                    else:
-                        entropy_loss = 0
-
-                    # compute policy loss
-                    ratio = torch.exp(next_log_prob - sampled_log_prob)
-                    surrogate = sampled_advantages * ratio
-                    surrogate_clipped = sampled_advantages * torch.clip(
-                        ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
-                    )
-
-                    policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
-
-                    # compute value loss
-                    predicted_values, _ = self.value.act(inputs, role="value")
-
-                    if self.cfg.value_clip > 0:
-                        predicted_values = sampled_values + torch.clip(
-                            predicted_values - sampled_values, min=-self.cfg.value_clip, max=self.cfg.value_clip
-                        )
-                    value_loss = self.cfg.value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
-
-                # optimization step
-                self.optimizer.zero_grad()
-                self.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
-
-                if config.torch.is_distributed:
-                    self.teacher.reduce_parameters()
-                    if self.teacher is not self.value:
-                        self.value.reduce_parameters()
-
-                if self.cfg.grad_norm_clip > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    if self.teacher is self.value:
-                        nn.utils.clip_grad_norm_(self.teacher.parameters(), self.cfg.grad_norm_clip)
-                    else:
-                        nn.utils.clip_grad_norm_(
-                            itertools.chain(self.teacher.parameters(), self.value.parameters()), self.cfg.grad_norm_clip
+                        # compute policy loss
+                        ratio = torch.exp(next_log_prob - sampled_log_prob)
+                        surrogate = sampled_advantages * ratio
+                        surrogate_clipped = sampled_advantages * torch.clip(
+                            ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
                         )
 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                        policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
 
-                # update cumulative losses
-                cumulative_teacher_loss += policy_loss.item()
-                cumulative_value_loss += value_loss.item()
-                if self.cfg.entropy_loss_scale:
-                    cumulative_entropy_loss += entropy_loss.item()
+                        # compute value loss
+                        predicted_values, _ = self.value.act(inputs, role="value")
 
-            # update learning rate
-            if self.scheduler:
-                if isinstance(self.scheduler, KLAdaptiveLR):
-                    kl = torch.tensor(kl_divergences, device=self.device).mean()
-                    # reduce (collect from all workers/processes) KL in distributed runs
+                        if self.cfg.value_clip > 0:
+                            predicted_values = sampled_values + torch.clip(
+                                predicted_values - sampled_values, min=-self.cfg.value_clip, max=self.cfg.value_clip
+                            )
+                        value_loss = self.cfg.value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
+
+                    # optimization step
+                    self.optimizer.zero_grad()
+                    self.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
+
                     if config.torch.is_distributed:
-                        torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
-                        kl /= config.torch.world_size
-                    self.scheduler.step(kl.item())
-                else:
-                    self.scheduler.step()
+                        self.teacher.reduce_parameters()
+                        if self.teacher is not self.value:
+                            self.value.reduce_parameters()
 
-        # Student learning epochs: Supervised learning
-        if timestep >= 512+64-1: # debug
+                    if self.cfg.grad_norm_clip > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        if self.teacher is self.value:
+                            nn.utils.clip_grad_norm_(self.teacher.parameters(), self.cfg.grad_norm_clip)
+                        else:
+                            nn.utils.clip_grad_norm_(
+                                itertools.chain(self.teacher.parameters(), self.value.parameters()), self.cfg.grad_norm_clip
+                            )
+
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+
+                    # update cumulative losses
+                    cumulative_teacher_loss += policy_loss.item()
+                    cumulative_value_loss += value_loss.item()
+                    if self.cfg.entropy_loss_scale:
+                        cumulative_entropy_loss += entropy_loss.item()
+
+                # update learning rate
+                if self.scheduler:
+                    if isinstance(self.scheduler, KLAdaptiveLR):
+                        kl = torch.tensor(kl_divergences, device=self.device).mean()
+                        # reduce (collect from all workers/processes) KL in distributed runs
+                        if config.torch.is_distributed:
+                            torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
+                            kl /= config.torch.world_size
+                        self.scheduler.step(kl.item())
+                    else:
+                        self.scheduler.step()
+            
+            # record data
+            self.track_data(
+                "Loss / Teacher Policy loss", cumulative_teacher_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
+            )
+            self.track_data(
+                "Loss / Value loss", cumulative_value_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
+            )
+            if self.cfg.entropy_loss_scale:
+                self.track_data(
+                    "Loss / Entropy loss", cumulative_entropy_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
+                )
+
+            self.track_data("Policy / Teacher Standard deviation", self.teacher.distribution().stddev.mean().item())
+        # Student learning epochs: Supervised learning on teacher's actions
+        else:
             cumulative_student_loss = 0
             sampled_batches = self.memory.sample_all(names=self._tensors_names, mini_batches=self.cfg.student_mini_batches)
             for epoch in tqdm(range(self.cfg.student_learning_epochs)):
@@ -532,18 +546,5 @@ class SITT(Agent):
             self.track_data("Policy / Student Standard deviation", self.student.distribution().stddev.mean().item())
 
         # record data
-        self.track_data(
-            "Loss / Teacher Policy loss", cumulative_teacher_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
-        )
-        self.track_data(
-            "Loss / Value loss", cumulative_value_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
-        )
-        if self.cfg.entropy_loss_scale:
-            self.track_data(
-                "Loss / Entropy loss", cumulative_entropy_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
-            )
-
-        self.track_data("Policy / Teacher Standard deviation", self.teacher.distribution().stddev.mean().item())
-
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])

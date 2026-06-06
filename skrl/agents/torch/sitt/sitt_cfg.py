@@ -150,6 +150,9 @@ class SITT_CFG(AgentCfg):
     kl_penalty_scale: float = 0.0
     """KL-divergence penalty between teacher and student for reward shaping."""
 
+    start_student_training_timestep: int = 5_000
+    """Timestep to start training the student network."""
+
     def expand(self) -> None:
         """Expand the configuration."""
         super().expand()
