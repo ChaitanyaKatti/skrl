@@ -150,8 +150,18 @@ class SITT_CFG(AgentCfg):
     kl_penalty_scale: float = 0.0
     """KL-divergence penalty between teacher and student for reward shaping."""
 
+    proxy_alignment_scale: float = 0.01
+    """Scale for L1 feature-alignment loss added to the teacher's PPO loss.
+    Pulls teacher features toward the proxy-student (which approximates student)."""
+
+    alignment_epochs: int = 20
+    """Number of epochs for the proxy→student and student→teacher alignment phase."""
+
+    alignment_mini_batches: int = 16
+    """Mini-batches to sample during the alignment phase."""
+
     start_student_training_timestep: int = 5_000
-    """Timestep to start training the student network."""
+    """Timestep to start joint student/proxy training alongside the teacher PPO."""
 
     def expand(self) -> None:
         """Expand the configuration."""
